@@ -121,6 +121,9 @@ agent-slack auth import-firefox
 agent-slack auth test
 ```
 
+Note for Chrome import on macOS: if Chrome reports AppleScript JavaScript is disabled,
+enable `View > Developer > Allow JavaScript from Apple Events`.
+
 Alternatively, set env vars:
 
 ```bash

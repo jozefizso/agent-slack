@@ -71,6 +71,9 @@ agent-slack auth import-firefox
 agent-slack auth test
 ```
 
+If Chrome reports AppleScript JavaScript is disabled, enable
+`View > Developer > Allow JavaScript from Apple Events`.
+
 - Or set env vars (browser tokens; avoid pasting these into chat logs):
 
 ```bash

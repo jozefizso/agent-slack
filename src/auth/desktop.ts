@@ -49,6 +49,12 @@ const SLACK_SUPPORT_DIR_LINUX_FLATPAK = join(
   "Slack",
 );
 
+type SlackPathCandidate = {
+  baseDir: string;
+  leveldbDir: string;
+  cookiesDb: string;
+};
+
 // Windows: regular installer stores data in %APPDATA%\Slack
 const SLACK_SUPPORT_DIR_WIN_APPDATA = join(
   process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
@@ -74,7 +80,7 @@ function getWindowsStoreSlackPath(): string | null {
   return null;
 }
 
-function getAllSlackPaths(): { leveldbDir: string; cookiesDb: string; baseDir: string }[] {
+function getSlackPathCandidates(): SlackPathCandidate[] {
   let candidates: string[];
   if (IS_MACOS) {
     candidates = [SLACK_SUPPORT_DIR_ELECTRON, SLACK_SUPPORT_DIR_APPSTORE];
@@ -94,24 +100,24 @@ function getAllSlackPaths(): { leveldbDir: string; cookiesDb: string; baseDir: s
     throw new Error(`Slack Desktop extraction is not supported on ${PLATFORM}.`);
   }
 
-  const results: { leveldbDir: string; cookiesDb: string; baseDir: string }[] = [];
+  const out: SlackPathCandidate[] = [];
   for (const dir of candidates) {
     const leveldbDir = join(dir, "Local Storage", "leveldb");
     if (existsSync(leveldbDir)) {
       const cookiesDbCandidates = [join(dir, "Network", "Cookies"), join(dir, "Cookies")];
       const cookiesDb =
         cookiesDbCandidates.find((candidate) => existsSync(candidate)) || cookiesDbCandidates[0]!;
-      results.push({ leveldbDir, cookiesDb, baseDir: dir });
+      out.push({ baseDir: dir, leveldbDir, cookiesDb });
     }
   }
 
-  if (results.length === 0) {
-    throw new Error(
-      `Slack Desktop data not found. Checked:\n  - ${candidates.map((d) => join(d, "Local Storage", "leveldb")).join("\n  - ")}`,
-    );
+  if (out.length > 0) {
+    return out;
   }
 
-  return results;
+  throw new Error(
+    `Slack Desktop data not found. Checked:\n  - ${candidates.map((d) => join(d, "Local Storage", "leveldb")).join("\n  - ")}`,
+  );
 }
 
 function toDesktopTeam(value: unknown): DesktopTeam | null {
@@ -131,17 +137,24 @@ async function snapshotLevelDb(srcDir: string): Promise<string> {
   const base = join(homedir(), ".config", "agent-slack", "cache", "leveldb-snapshots");
   const dest = join(base, `${Date.now()}`);
   await mkdir(base, { recursive: true });
-  let useNodeCopy = !IS_MACOS;
+  let copiedWithShell = false;
   if (IS_MACOS) {
     try {
       execFileSync("cp", ["-cR", srcDir, dest], {
         stdio: ["ignore", "ignore", "ignore"],
       });
+      copiedWithShell = true;
     } catch {
-      useNodeCopy = true;
+      // clonefile can fail with EPERM on some protected app-data directories.
+      // Force plain byte copy mode to avoid macOS copyfile/clonefile paths.
+      execFileSync("cp", ["-R", srcDir, dest], {
+        env: { ...process.env, COPYFILE_DISABLE: "1" },
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+      copiedWithShell = true;
     }
   }
-  if (useNodeCopy) {
+  if (!copiedWithShell) {
     await cp(srcDir, dest, { recursive: true, force: true });
   }
 
@@ -203,14 +216,22 @@ async function extractTeamsFromSlackLevelDb(leveldbDir: string): Promise<Desktop
     throw new Error(`Slack LevelDB not found: ${leveldbDir}`);
   }
 
-  const snap = await snapshotLevelDb(leveldbDir);
+  let readDir = leveldbDir;
+  let snap: string | null = null;
+  let snapshotError: unknown;
+  try {
+    snap = await snapshotLevelDb(leveldbDir);
+    readDir = snap;
+  } catch (error) {
+    snapshotError = error;
+  }
 
   try {
     // Use pure JS LevelDB reader - search for localConfig entries
     const localConfigV2 = Buffer.from("localConfig_v2");
     const localConfigV3 = Buffer.from("localConfig_v3");
 
-    const entries = await findKeysContaining(snap, Buffer.from("localConfig_v"));
+    const entries = await findKeysContaining(readDir, Buffer.from("localConfig_v"));
 
     let configBuf: Buffer | null = null;
     let configRank = -1n;
@@ -245,13 +266,73 @@ async function extractTeamsFromSlackLevelDb(leveldbDir: string): Promise<Desktop
       throw new Error("No xoxc tokens found in Slack localConfig");
     }
     return teams;
+  } catch (error) {
+    if (snapshotError) {
+      const reason =
+        snapshotError instanceof Error
+          ? snapshotError.message
+          : "unknown snapshot error while copying LevelDB";
+      throw new Error(
+        `Failed to snapshot Slack LevelDB (${reason}) and fallback read also failed: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    }
+    throw error;
   } finally {
-    try {
-      await rm(snap, { recursive: true, force: true });
-    } catch {
-      // ignore
+    if (snap) {
+      try {
+        await rm(snap, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
     }
   }
+}
+
+function extractXoxdToken(text: string): string | null {
+  if (!text) {
+    return null;
+  }
+  const direct = text.match(/xoxd-[A-Za-z0-9%/+_=.-]+/);
+  if (direct) {
+    return direct[0]!;
+  }
+  try {
+    const decoded = decodeURIComponent(text);
+    const decodedMatch = decoded.match(/xoxd-[A-Za-z0-9%/+_=.-]+/);
+    if (decodedMatch) {
+      return decodedMatch[0]!;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function extractCookieCandidate(text: string): string | null {
+  if (!text) {
+    return null;
+  }
+
+  const xoxd = extractXoxdToken(text);
+  if (xoxd) {
+    return xoxd;
+  }
+
+  const trimmed = text.trim();
+  const likelyCookie = /^[A-Za-z0-9%/+_=.-]{20,}$/.test(trimmed);
+  if (likelyCookie) {
+    return trimmed;
+  }
+
+  try {
+    const decoded = decodeURIComponent(trimmed);
+    if (/^[A-Za-z0-9%/+_=.-]{20,}$/.test(decoded)) {
+      return decoded;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
 }
 
 async function extractCookieDFromSlackCookiesDb(
@@ -295,74 +376,121 @@ async function extractCookieDFromSlackCookiesDb(
   if (!rows || rows.length === 0) {
     throw new Error("No Slack 'd' cookie found");
   }
-  const row = rows[0]!;
-  if (row.value && row.value.startsWith("xoxd-")) {
-    return row.value;
-  }
+  const fallbackCandidates: string[] = [];
 
-  const encrypted = Buffer.from(row.encrypted_value || []);
-  if (encrypted.length === 0) {
-    throw new Error("Slack 'd' cookie had no encrypted_value");
-  }
+  for (const row of rows) {
+    const plain = extractCookieCandidate(typeof row.value === "string" ? row.value : "");
+    if (plain) {
+      if (plain.startsWith("xoxd-")) {
+        return plain;
+      }
+      fallbackCandidates.push(plain);
+    }
 
-  const prefix = encrypted.subarray(0, 3).toString("utf8");
+    const encrypted = Buffer.from(row.encrypted_value || []);
+    if (encrypted.length === 0) {
+      continue;
+    }
 
-  // Windows uses DPAPI + AES-256-GCM (Chromium v80+)
-  if (IS_WIN32 && (prefix === "v10" || prefix === "v11")) {
-    const decrypted = decryptCookieWindows(encrypted, slackDataDir);
-    const match = decrypted.match(/xoxd-[A-Za-z0-9%/+_=.-]+/);
-    if (match) {
+    const prefix = encrypted.subarray(0, 3).toString("utf8");
+
+    if (IS_WIN32) {
+      if (prefix === "v10" || prefix === "v11") {
+        try {
+          const decrypted = decryptCookieWindows(encrypted, slackDataDir);
+          const token = extractCookieCandidate(decrypted);
+          if (token) {
+            if (token.startsWith("xoxd-")) {
+              return token;
+            }
+            fallbackCandidates.push(token);
+          }
+        } catch {
+          // continue
+        }
+      }
+      continue;
+    }
+
+    const data = prefix === "v10" || prefix === "v11" ? encrypted.subarray(3) : encrypted;
+    const passwords = getSafeStoragePasswords(prefix);
+
+    for (const password of passwords) {
       try {
-        return decodeURIComponent(match[0]!);
+        const decrypted = decryptChromiumCookieValue(data, {
+          password,
+          iterations: IS_LINUX ? 1 : 1003,
+        });
+        const token = extractCookieCandidate(decrypted);
+        if (token) {
+          if (token.startsWith("xoxd-")) {
+            return token;
+          }
+          fallbackCandidates.push(token);
+        }
       } catch {
-        return match[0]!;
+        // continue
       }
     }
-    throw new Error("Could not locate xoxd-* in DPAPI-decrypted Slack cookie");
   }
 
-  // macOS / Linux: password-based AES-128-CBC
-  const data = prefix === "v10" || prefix === "v11" ? encrypted.subarray(3) : encrypted;
-  const passwords = getSafeStoragePasswords(prefix);
-
-  for (const password of passwords) {
-    try {
-      const decrypted = decryptChromiumCookieValue(data, {
-        password,
-        iterations: IS_LINUX ? 1 : 1003,
-      });
-      const match = decrypted.match(/xoxd-[A-Za-z0-9%/+_=.-]+/);
-      if (match) {
-        return match[0]!;
-      }
-    } catch {
-      // continue
-    }
+  if (fallbackCandidates.length > 0) {
+    // Prefer the most information-rich value if xoxd prefix is absent.
+    fallbackCandidates.sort((a, b) => b.length - a.length);
+    return fallbackCandidates[0]!;
   }
 
   throw new Error("Could not locate xoxd-* in decrypted Slack cookie");
 }
 
 export async function extractFromSlackDesktop(): Promise<DesktopExtracted> {
-  const allPaths = getAllSlackPaths();
+  const candidates = getSlackPathCandidates();
 
-  // Try each candidate path; use the first one where both LevelDB and cookie extraction succeed.
-  const errors: string[] = [];
-  for (const { leveldbDir, cookiesDb, baseDir } of allPaths) {
+  let teams: DesktopTeam[] | null = null;
+  let leveldbPath = "";
+  const leveldbErrors: string[] = [];
+  for (const candidate of candidates) {
     try {
-      const teams = await extractTeamsFromSlackLevelDb(leveldbDir);
-      const cookie_d = await extractCookieDFromSlackCookiesDb(cookiesDb, baseDir);
-      return {
-        cookie_d,
-        teams,
-        source: { leveldb_path: leveldbDir, cookies_path: cookiesDb },
-      };
-    } catch (err: unknown) {
-      errors.push(`${baseDir}: ${err instanceof Error ? err.message : String(err)}`);
+      teams = await extractTeamsFromSlackLevelDb(candidate.leveldbDir);
+      leveldbPath = candidate.leveldbDir;
+      break;
+    } catch (error) {
+      leveldbErrors.push(
+        `${candidate.leveldbDir}: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
     }
   }
 
-  throw new Error(
-    `Could not extract Slack Desktop credentials from any location:\n  - ${errors.join("\n  - ")}`,
-  );
+  if (!teams) {
+    throw new Error(
+      `Failed to extract Slack teams from LevelDB:\n  - ${leveldbErrors.join("\n  - ")}`,
+    );
+  }
+
+  let cookie_d = "";
+  let cookiesPath = "";
+  const cookieErrors: string[] = [];
+  for (const candidate of candidates) {
+    try {
+      cookie_d = await extractCookieDFromSlackCookiesDb(candidate.cookiesDb, candidate.baseDir);
+      cookiesPath = candidate.cookiesDb;
+      break;
+    } catch (error) {
+      cookieErrors.push(
+        `${candidate.cookiesDb}: ${error instanceof Error ? error.message : "unknown error"}`,
+      );
+    }
+  }
+
+  if (!cookie_d) {
+    throw new Error(
+      `Failed to extract Slack cookie 'd' from Desktop cookies DB:\n  - ${cookieErrors.join("\n  - ")}`,
+    );
+  }
+
+  return {
+    cookie_d,
+    teams,
+    source: { leveldb_path: leveldbPath, cookies_path: cookiesPath },
+  };
 }

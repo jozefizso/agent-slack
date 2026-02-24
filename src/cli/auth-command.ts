@@ -81,7 +81,7 @@ export function registerAuthCommand(input: { program: Command; ctx: CliContext }
         const extracted = input.ctx.importChrome();
         if (!extracted) {
           throw new Error(
-            "Could not extract tokens from Chrome. Open Slack in Chrome and ensure you're logged in.",
+            "Could not extract tokens from Chrome. Open Slack in Chrome and ensure you're logged in. If Chrome shows an AppleScript error, enable View > Developer > Allow JavaScript from Apple Events.",
           );
         }
 
